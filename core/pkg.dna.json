@@ -1,0 +1,13 @@
+{
+    "slug": "core",
+    "name": "Core",
+    "title": "Shinobi Package :: Core",
+    "type": "library",
+    "version": "0.1.0",
+    "description": "A Shinobi capability.",
+    "namespace": "Shinobi\\Core\\",
+    "requires": {
+        "php": ">=8.4"
+    },
+    "extra": []
+}

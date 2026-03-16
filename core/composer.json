@@ -1,0 +1,22 @@
+{
+    "name": "shinobiphp/core",
+    "description": "A Shinobi capability.",
+    "type": "library",
+    "require": {
+	        "php": ">=8.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Shinobi\Core\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Shinobi B",
+            "email": "shinobiphp@gmail.com"
+        }
+    ],
+    "config": {
+	"bin-dir": "bin/"
+    }
+}

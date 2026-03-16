@@ -1,0 +1,353 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * SHINOBI :: Sovereign Package Toolkit (pkg)
+ * Production Orchestrator [2026]
+ */
+
+declare(strict_types=1);
+
+// --- 1. ENVIRONMENT ---
+$scriptDir = __DIR__ . DIRECTORY_SEPARATOR;
+$possibleRoot = realpath($scriptDir . '../shinobi');
+define('SHINOBI_ROOT', ($possibleRoot ?: realpath($scriptDir . '..')) . DIRECTORY_SEPARATOR);
+define('WORKSPACE_ROOT', $scriptDir);
+$defaultTemplate = WORKSPACE_ROOT . '.default';
+
+// --- 2. EXECUTION ---
+$action = $argv[1] ?? 'help';
+$args = parse_args($argv);
+
+try {
+    match ($action) {
+        'build'        => build_from_spec($args, $defaultTemplate, WORKSPACE_ROOT),
+        'create'       => create_package($args, $defaultTemplate, WORKSPACE_ROOT),
+        'copy'         => copy_package($args, WORKSPACE_ROOT),
+        'set'          => set_metadata($args, WORKSPACE_ROOT),
+        'info', 'show' => show_info($args, WORKSPACE_ROOT),
+        'list'         => list_packages($args, WORKSPACE_ROOT),
+        'rm', 'delete' => delete_packages($args, WORKSPACE_ROOT),
+        'pull', 'sync' => bulk_sync('pull', $args, WORKSPACE_ROOT),
+        'push'         => bulk_sync('push', $args, WORKSPACE_ROOT),
+        'help'         => usage(),
+        default        => throw new Exception("Unknown action: $action"),
+    };
+} catch (Exception $e) {
+    echo "\033[31mError: " . $e->getMessage() . "\033[0m\n";
+    exit(1);
+}
+
+// --- 3. BUILD & MANIFEST ENGINE ---
+
+function build_from_spec(array $args, string $template, string $workspace): void {
+    $specPath = $args['spec'] ?? throw new Exception("Usage: ./pkg build --spec=bootstrap.json");
+    if (!file_exists($specPath)) throw new Exception("Spec not found: $specPath");
+    
+    $raw = file_get_contents($specPath);
+    $data = json_decode($raw, true);
+    
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        throw new Exception("JSON Error in spec: " . json_last_error_msg());
+    }
+
+    $packages = isset($data['name']) ? [$data] : $data;
+    if (!is_array($packages)) throw new Exception("Spec must be a package object or an array of objects.");
+
+    foreach ($packages as $spec) {
+        manifest_package($spec, $template, $workspace);
+    }
+}
+
+function manifest_package(array $spec, string $template, string $workspace): void {
+    $name = $spec['name'] ?? throw new Exception("Spec object missing 'name'.");
+    $slug = $spec['slug'] ?? str_replace([' ', '_'], '-', strtolower((string)$name));
+    
+    // 1. Base Genesis
+    create_package($spec, $template, $workspace);
+    
+    $target = $workspace . $slug;
+    $dna = load_dna($target);
+
+    // 2. Structural Build
+    if (isset($spec['src']) && is_array($spec['src'])) {
+        foreach ($spec['src'] as $subFolder => $files) {
+            $dirPath = $target . '/src/' . $subFolder;
+            if (!is_dir($dirPath)) mkdir($dirPath, 0755, true);
+
+            foreach ($files as $fileSpec) {
+                generate_php_file($dirPath, $subFolder, $fileSpec, $dna);
+            }
+        }
+    }
+    echo "🏗️  Deep structural build complete for $slug\n";
+}
+
+// --- 4. CORE ACTIONS ---
+
+function create_package(array $args, string $template, string $workspace): void {
+    $name = $args['name'] ?? end($args['_pos']) ?: throw new Exception("Name required.");
+    $slug = $args['slug'] ?? str_replace([' ', '_'], '-', strtolower((string)$name));
+    
+    $dna = map_greedy_dna([
+        'slug'        => $slug,
+        'name'        => ucwords(str_replace('-', ' ', $slug)),
+        'title'       => "Shinobi Package :: " . ucwords(str_replace('-', ' ', $slug)),
+        'type'        => 'library',
+        'version'     => '0.1.0',
+        'description' => "A Shinobi capability.",
+        'namespace'   => "Shinobi\\Core\\",
+        'requires'    => process_requires($args['requires'] ?? 'php@>=8.4'),
+        'extra'       => []
+    ], $args);
+
+    $target = $workspace . $slug;
+    if (is_dir($target)) handle_collision($target, $args['on-exists'] ?? 'error');
+
+    echo "⛩️  Genesis: $slug\n";
+    iterate_and_hydrate($template, $target, ['package' => $dna]);
+    save_dna($target, $dna);
+
+    if (!empty($dna['requires'])) install_dependencies($target, $dna['requires']);
+}
+
+function copy_package(array $args, string $workspace): void {
+    $pos = $args['_pos'];
+    $sourceSlug = $pos[0] ?? throw new Exception("Usage: ./pkg copy [source] [target]");
+    $targetSlug = $pos[1] ?? throw new Exception("Target name required.");
+    
+    $source = $workspace . $sourceSlug;
+    $target = $workspace . $targetSlug;
+
+    if (!is_dir($source)) throw new Exception("Source '$sourceSlug' not found.");
+    if (is_dir($target)) handle_collision($target, $args['on-exists'] ?? 'error');
+
+    passthru("cp -r " . escapeshellarg($source) . " " . escapeshellarg($target));
+
+    $dna = load_dna($target);
+    $dna['slug'] = $targetSlug;
+    $dna['name'] = ucwords(str_replace('-', ' ', $targetSlug));
+    
+    $dna = map_greedy_dna($dna, $args);
+    save_dna($target, $dna);
+    iterate_and_hydrate($target, $target, ['package' => $dna]);
+    echo "🧬 Mutated $sourceSlug to $targetSlug\n";
+}
+
+function show_info(array $args, string $workspace): void {
+    $targets = get_targets($args, $workspace);
+    foreach ($targets as $slug) {
+        $dna = load_dna($workspace . $slug);
+        echo "\n\033[36m--- DNA: {$dna['name']} ({$dna['slug']}) ---\033[0m\n";
+        foreach ($dna as $k => $v) {
+            if ($k === 'extra' || $k === 'requires') continue;
+            echo str_pad(ucfirst($k) . ":", 15) . $v . "\n";
+        }
+        echo "Requires:      " . json_encode($dna['requires'], JSON_UNESCAPED_SLASHES) . "\n";
+        if (!empty($dna['extra'])) {
+            echo "\033[33mAttributes:\033[0m    " . json_encode($dna['extra'], JSON_UNESCAPED_SLASHES) . "\n";
+        }
+    }
+}
+
+function list_packages(array $args, string $workspace): void {
+    $verbose = $args['v'] ?? $args['verbose'] ?? false;
+    echo "\033[36m" . str_pad("SLUG", 15) . str_pad("VERSION", 10) . "DESCRIPTION\033[0m\n";
+    echo str_repeat("-", 60) . "\n";
+
+    foreach (get_all_pkg_slugs($workspace) as $slug) {
+        $dna = load_dna($workspace . $slug);
+        echo str_pad($slug, 15) . str_pad($dna['version'], 10) . mb_strimwidth($dna['description'], 0, 35, "...") . "\n";
+        if ($verbose) {
+            echo "  \033[90mNamespace: {$dna['namespace']} | Type: {$dna['type']}\033[0m\n";
+        }
+    }
+}
+
+function delete_packages(array $args, string $workspace): void {
+    if (!($args['f'] ?? $args['force'] ?? false)) throw new Exception("Delete requires -f");
+    $targets = get_targets($args, $workspace);
+    foreach ($targets as $slug) {
+        passthru("rm -rf " . escapeshellarg($workspace . $slug));
+        echo "🗑️  Purged: $slug\n";
+    }
+}
+
+function set_metadata(array $args, string $workspace): void {
+    $targets = get_targets($args, $workspace);
+    foreach ($targets as $slug) {
+        $dna = map_greedy_dna(load_dna($workspace . $slug), $args);
+        save_dna($workspace . $slug, $dna);
+        iterate_and_hydrate($workspace . $slug, $workspace . $slug, ['package' => $dna]);
+        echo "✅ Updated: $slug\n";
+    }
+}
+
+// --- 5. UTILITIES ---
+
+function map_greedy_dna(array $dna, array $args): array {
+    $reserved = ['on-exists', 'repo', 'branch', 'f', 'force', 'all', 'a', 'v', 'verbose', 'spec', 'src'];
+    $core = array_keys($dna);
+
+    foreach ($args as $k => $v) {
+        if ($k === '_pos' || in_array($k, $reserved)) continue;
+        if (in_array($k, $core)) {
+            $dna[$k] = $v;
+        } else {
+            $dna['extra'][$k] = $v;
+        }
+    }
+    return $dna;
+}
+
+function generate_php_file(string $dirPath, string $subFolder, mixed $fileSpec, array $dna): void {
+    $isObject = is_array($fileSpec);
+    $filename = $isObject ? ($fileSpec['filename'] ?? 'Generic.php') : $fileSpec;
+    $className = str_replace('.php', '', $filename);
+    $namespace = $fileSpec['namespace'] ?? (rtrim($dna['namespace'], '\\') . '\\' . str_replace('/', '\\', $subFolder));
+    
+    $code = "<?php\n\ndeclare(strict_types=1);\n\nnamespace $namespace;\n\n";
+
+    if (isset($fileSpec['uses'])) {
+        foreach ((array)$fileSpec['uses'] as $use) $code .= "use $use;\n";
+        $code .= "\n";
+    }
+
+    if (isset($fileSpec['attributes'])) {
+        foreach ((array)$fileSpec['attributes'] as $attr) $code .= "#[$attr]\n";
+    }
+
+    $type = $fileSpec['type'] ?? 'class';
+    $extends = isset($fileSpec['extends']) ? " extends {$fileSpec['extends']}" : '';
+    $implements = isset($fileSpec['implements']) ? " implements " . implode(', ', (array)$fileSpec['implements']) : '';
+    
+    $code .= "$type $className$extends$implements\n{\n";
+    $code .= $fileSpec['body'] ?? "    // Built by Shinobi Forge\n";
+    $code .= "}\n";
+
+    file_put_contents($dirPath . '/' . $filename, $code);
+}
+
+function iterate_and_hydrate(string $template, string $target, array $tokens): void {
+    if (!is_dir($template)) return;
+    $flat = $tokens['package'];
+    $extra = $flat['extra'] ?? [];
+    unset($flat['extra']);
+    
+    foreach ($extra as $k => $v) $flat[$k] = is_array($v) ? json_encode($v) : (string)$v;
+    $flat['requires'] = format_requires_for_template($tokens['package']['requires'] ?? []);
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($template, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        if ($item->getFilename() === 'pkg.dna.json') continue;
+        $dest = $target . str_replace($template, '', $item->getPathname());
+        if ($item->isDir()) {
+            if (!is_dir($dest)) mkdir($dest, 0755, true);
+        } else {
+            if (!is_dir(dirname($dest))) mkdir(dirname($dest), 0755, true);
+            $content = file_get_contents($item->getPathname());
+            foreach ($flat as $key => $val) {
+                $content = str_replace("%package.$key%", (string)$val, $content);
+            }
+            file_put_contents($dest, $content);
+        }
+    }
+}
+
+function process_requires(mixed $input): array {
+    if (is_array($input)) return $input;
+    if (empty($input)) return [];
+    $map = [];
+    foreach (explode(',', (string)$input) as $item) {
+        if (str_contains($item, '@')) {
+            [$pkg, $ver] = explode('@', $item, 2);
+            $map[trim($pkg)] = trim($ver);
+        } else { $map[trim($item)] = "*"; }
+    }
+    return $map;
+}
+
+function format_requires_for_template(array $requires): string {
+    $lines = [];
+    foreach ($requires as $pkg => $ver) { $lines[] = "        \"$pkg\": \"$ver\""; }
+    return implode(",\n", $lines);
+}
+
+function install_dependencies(string $target, array $requires): void {
+    $toRequire = [];
+    foreach ($requires as $pkg => $ver) {
+        if ($pkg === 'php') continue;
+        $toRequire[] = escapeshellarg($pkg . ($ver === '*' ? "" : ":$ver"));
+    }
+    if (!empty($toRequire)) {
+        echo "📦 Syncing dependencies for " . basename($target) . "...\n";
+        passthru("cd " . escapeshellarg($target) . " && composer require " . implode(' ', $toRequire) . " --no-update");
+        passthru("cd " . escapeshellarg($target) . " && composer update --quiet");
+    }
+}
+
+function get_targets(array $args, string $workspace): array {
+    if ($args['a'] ?? $args['all'] ?? false) return get_all_pkg_slugs($workspace);
+    $input = $args['name'] ?? end($args['_pos']);
+    return $input ? array_map('trim', explode(',', (string)$input)) : [];
+}
+
+function get_all_pkg_slugs(string $workspace): array {
+    $slugs = [];
+    foreach (array_filter(glob($workspace . '*'), 'is_dir') as $dir) {
+        $slug = basename($dir);
+        if (!in_array($slug, ['.default', 'etc', 'bin']) && file_exists($dir . '/pkg.dna.json')) {
+            $slugs[] = $slug;
+        }
+    }
+    return $slugs;
+}
+
+function bulk_sync(string $verb, array $args, string $workspace): void {
+    $targets = get_targets($args, $workspace);
+    foreach ($targets as $slug) {
+        echo "🌐 " . ucfirst($verb) . "ing $slug...\n";
+        passthru("cd " . escapeshellarg($workspace . $slug) . " && git $verb " . ($args['repo'] ?? 'origin') . " " . ($args['branch'] ?? 'master'));
+    }
+}
+
+function handle_collision(string $target, string $mode): void {
+    if ($mode === 'overwrite') passthru("rm -rf " . escapeshellarg($target));
+    elseif (is_dir($target)) throw new Exception("Collision: $target already exists.");
+}
+
+function save_dna(string $path, array $data): void {
+    file_put_contents($path . '/pkg.dna.json', json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+}
+
+function load_dna(string $path): array {
+    $file = $path . '/pkg.dna.json';
+    if (!file_exists($file)) throw new Exception("DNA missing for package: " . basename($path));
+    return json_decode(file_get_contents($file), true);
+}
+
+function parse_args(array $argv): array {
+    $args = ['_pos' => []]; array_shift($argv); array_shift($argv);
+    foreach ($argv as $arg) {
+        if (str_starts_with($arg, '--')) {
+            $parts = explode('=', substr($arg, 2), 2);
+            $args[$parts[0]] = $parts[1] ?? true;
+        } elseif (str_starts_with($arg, '-')) {
+            foreach (str_split(substr($arg, 1)) as $char) $args[$char] = true;
+        } else { $args['_pos'][] = $arg; }
+    }
+    return $args;
+}
+
+function usage(): void {
+    echo "\033[33mShinobi pkg Toolkit\033[0m\n";
+    echo "  ./pkg build --spec=bootstrap.json\n";
+    echo "  ./pkg create core --requires=php@>=8.4\n";
+    echo "  ./pkg info core,dna\n";
+    echo "  ./pkg list -v\n";
+    echo "  ./pkg set -a --version=1.1.0\n";
+}
